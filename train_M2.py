@@ -30,7 +30,7 @@ import_path = os.path.abspath(os.path.join(current_path, "../.."))
 if import_path not in sys.path:
     sys.path.append(import_path)
 
-# tensorboard --logdir=/media/newhd/Ha/my_env/cell_5_segmentation/model_postprocess/summary
+# tensorboard --logdir=/media/newhd/Ha/my_env/cell_5_segmentation_F0005/model_postprocess/summary
 # 10.66.31.24:6006
 # hostname -I  # Check hostname
 # sudo netstat -ntlp | grep LISTEN  # Check ports open
@@ -38,7 +38,7 @@ if import_path not in sys.path:
 # PROJECT_DIR = '/Users/phanha/Google Drive/Work/PyCharm/el_2.1'
 PROJECT_DIR = '/media/newhd/Ha/my_env/cell_5_segmentation_F0005'
 
-MODEL_DIR = os.path.join(PROJECT_DIR, "model_tracking")
+MODEL_DIR = os.path.join(PROJECT_DIR, "model_postprocess")
 CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
 SUMMARY_DIR = os.path.join(MODEL_DIR, "summary")
 
@@ -70,8 +70,8 @@ sess = tf.Session(config=config)
 
 # GET DATA
 data = np.load(os.path.join('/media/newhd/Ha/my_env/cell_5_segmentation_F0005', 'clean_segments.npz'))
-training_labels = data['segmentation'][:, ::2, ::2]
-training_labels = np.expand_dims(training_labels, -1)
+training_data = data['segmentation'][:, ::2, ::2]
+training_data = np.expand_dims(training_data, -1)
 
 data = np.load(os.path.join('/media/newhd/Ha/data/BAEC/F0005', 'raw_sequence', 'raw_sequence.npz'))
 raw_tensor = data['sequence'][:, ::4, ::4]
@@ -83,8 +83,8 @@ saver = None
 start_time = time.time()
 model = M2(sess, optimizer, saver, CHECKPOINT_DIR,
                  summary_writer=summary_writer,
-                 training_labels=training_labels,
-                     training_frames=raw_tensor)
+                 training_data=training_data,
+                 training_frames=raw_tensor)
 sess.run(tf.global_variables_initializer())
 duration = time.time() - start_time
 print "%.2f" % duration, 'graph building time ---'
@@ -102,8 +102,8 @@ if latest_checkpoint is not None:
     print tf.train.latest_checkpoint(CHECKPOINT_DIR), "tf.train.latest_checkpoint('./')"
     imported_meta.restore(sess, latest_checkpoint)
 
-    if False:
-        ends_segments = np.load(os.path.join('/media/newhd/Ha/my_env/cell_5_segmentation', 'tracking_segments.npz'))
+    if True:
+        ends_segments = np.load(os.path.join('/media/newhd/Ha/my_env/cell_5_segmentation_F0005', 'ends_segments.npz'))
         ends_segments = ends_segments['map'][:, ::2, ::2]
         ends_segments = np.expand_dims(ends_segments, -1)
         model.inference(ends_segments)

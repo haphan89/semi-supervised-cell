@@ -30,15 +30,14 @@ import_path = os.path.abspath(os.path.join(current_path, "../.."))
 if import_path not in sys.path:
     sys.path.append(import_path)
 
-# tensorboard --logdir=/media/newhd/Ha/my_env/cell_5_segmentation_F0005/model_postprocess/summary
-# 10.66.31.24:6006
-# hostname -I  # Check hostname
-# sudo netstat -ntlp | grep LISTEN  # Check ports open
+# tensorboard --logdir=/media/newhd/Ha/my_env/cell_10_k/model_k_2/summary
 
 # PROJECT_DIR = '/Users/phanha/Google Drive/Work/PyCharm/el_2.1'
-PROJECT_DIR = '/media/newhd/Ha/my_env/cell_5_segmentation_F0005'
+PROJECT_DIR = '/media/newhd/Ha/my_env/cell_10_k'
 
-MODEL_DIR = os.path.join(PROJECT_DIR, "model_postprocess")
+seq_len = 12
+
+MODEL_DIR = os.path.join(PROJECT_DIR, "model_k_" + str(seq_len))
 CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
 SUMMARY_DIR = os.path.join(MODEL_DIR, "summary")
 
@@ -68,23 +67,66 @@ config.gpu_options.per_process_gpu_memory_fraction = 0.9
 sess = tf.Session(config=config)
 # sess = tf.InteractiveSession()
 
-# GET DATA
-data = np.load(os.path.join('/media/newhd/Ha/my_env/cell_5_segmentation_F0005', 'clean_segments.npz'))
-training_data = data['segmentation'][:, ::2, ::2]
-training_data = np.expand_dims(training_data, -1)
+saver = None
+
+
+# Get data
+patch_size = 8
+compress_jump = 2
+def condense_raw(raw_tensor, compress_jump=compress_jump, patch_size=patch_size):
+    uncompressed_patch_size = patch_size * compress_jump
+    x_crop = raw_tensor.shape[2] - raw_tensor.shape[2] % uncompressed_patch_size
+    y_crop = raw_tensor.shape[1] - raw_tensor.shape[1] % uncompressed_patch_size
+    raw_tensor = raw_tensor[:, :y_crop, :x_crop]
+    raw_tensor = raw_tensor[:, 0::compress_jump, 0::compress_jump]  # .astype(np.float32)
+    return raw_tensor
 
 data = np.load(os.path.join('/media/newhd/Ha/data/BAEC/F0005', 'raw_sequence', 'raw_sequence.npz'))
-raw_tensor = data['sequence'][:, ::4, ::4]
-raw_tensor = np.expand_dims(raw_tensor, -1)
+# raw_tensor = condense_raw(data['sequence'])
+raw_tensor = data['sequence']
 
 
-saver = None
+def read_ground_truth(file_path):
+    """
+    :param file_path:
+    :return: [frame_id, x, y]
+    """
+    with open(file_path) as f:
+        lines = f.readlines()
+    # output = np.zeros((len(lines), 3))
+    output = None
+    skip = 0  # 111
+    for i in range(len(lines)):
+        content = lines[i].split(' ')
+        content = [int(np.round(float(x))) for x in content]
+        if int(float(content[0])) >= skip:
+            # print content[0]
+            if output is None:
+                a = np.array(content[:3], dtype='float32')
+                a[0] = a[0] - skip
+                a[0] -= 1
+                output = a
+            else:
+                a = np.array(content[:3], dtype='float32')
+                a[0] = a[0] - skip
+                a[0] -= 1
+                output = np.vstack((output, a))
+    # REORDER
+    output_2 = np.zeros_like(output)
+    output_2[:, 0] = output[:, 0]
+    output_2[:, 1] = output[:, 2]
+    output_2[:, 2] = output[:, 1]
+    return output_2
+
+gt_list = read_ground_truth(os.path.join('/media/newhd/Ha/data/BAEC/F0005', 'BAEC_seq5_mitosis.txt'))
+
 
 start_time = time.time()
 model = M3(sess, optimizer, saver, CHECKPOINT_DIR,
                  summary_writer=summary_writer,
-                 training_data=training_data,
-                 training_frames=raw_tensor)
+                 training_data=raw_tensor,
+                 training_labels=gt_list,
+              seq_len=seq_len)
 sess.run(tf.global_variables_initializer())
 duration = time.time() - start_time
 print "%.2f" % duration, 'graph building time ---'
@@ -102,21 +144,12 @@ if latest_checkpoint is not None:
     print tf.train.latest_checkpoint(CHECKPOINT_DIR), "tf.train.latest_checkpoint('./')"
     imported_meta.restore(sess, latest_checkpoint)
 
-    if True:
-        ends_segments = np.load(os.path.join('/media/newhd/Ha/my_env/cell_5_segmentation_F0005', 'ends_segments.npz'))
-        ends_segments = ends_segments['map'][:, ::2, ::2]
-        ends_segments = np.expand_dims(ends_segments, -1)
-        model.inference(ends_segments)
+    if False:
+        data = np.load('/media/newhd/Ha/data/BAEC/big/test.npz')
+        model.test()
     else:
         model.run_train()
 else:
     sess.graph.finalize()
     model.run_train()
 
-
-
-"""
-sudo apt-get update
-sudo apt-get install --no-install-recommends nvidia-384 libcuda1-384 nvidia-opencl-icd-384
-sudo reboot
-"""

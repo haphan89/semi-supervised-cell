@@ -1,214 +1,301 @@
 import tensorflow as tf
-import os
-import time
 import numpy as np
+import os, io
 from copy import deepcopy
-from scipy.ndimage import label
+from skimage.morphology import disk
+from skimage.measure import label
+from scipy.ndimage import binary_dilation, binary_erosion
+from scipy.ndimage import center_of_mass
+import time
+import matplotlib.pyplot as plt
 
 class M3(object):
     def __init__(self, session,
                  optimizer,
                  saver,
                  checkpoint_dir,
+                 max_gradient=5,
                  summary_writer=None,
                  summary_every=100,
                  save_every=2000,
-                 training=True,
-                 seq_len=20,
-                 no_cuts=1,
+                 seq_len=10,
+                 inference_z_jump=1,
                  batch_size=1,
                  training_data=None,
-                 training_frames=None):
+                 training_labels=None):
+
+        self.run_context = True
+        self.run_focus = True
+        self.run_combined = True
+
+        # Reduce resolution
+        self.res_reduce = 3
+        self.z_reduce = 1
+        training_data = training_data[::self.z_reduce, ::self.res_reduce, ::self.res_reduce]
+        training_data = np.expand_dims(training_data, -1)
+
         self.session = session
         self.optimizer = optimizer
         self.saver = saver
+        self.max_gradient = max_gradient
         self.summary_writer = summary_writer
         self.summary_every = summary_every
         self.save_every = save_every
         self.checkpoint_dir = checkpoint_dir
-        self.training = training
-
-        self.segment_groups = 6
+        # self.training = training
 
         self.batch_size = batch_size
         self.seq_len = seq_len
-        self.no_cuts = no_cuts
+        self.z_jump = inference_z_jump
         self.size_x = training_data.shape[1]
         self.size_y = training_data.shape[2]
-        self.training_data = training_data
-        self.training_frames = training_frames  # frames: [frame_id, x, y, 1]
+        self.training_data = training_data[:110, :, :, :]  # np.vstack((training_data, training_data[-1:, :, :]))
+        self.training_labels = training_labels
+        self.test_data = training_data[110:, :, :, :]
         self.global_step = tf.Variable(0, name='global_step', trainable=False)
+
+        self.epoch_size = int(self.training_data.shape[0] / self.batch_size)
 
         self.create_variables()
         self.summary_writer.add_graph(self.session.graph)
 
         self.compress_jump = 1
-        self.z_tolerance = 1
-        self.xy_tolerance = 10
+        self.z_tolerance = 3
+        self.z_tolerance_training = 1
+        self.xy_tolerance = int(np.ceil(10/self.res_reduce))
 
     def create_variables(self):
-        self.x = tf.placeholder(tf.float32, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1], name='input_x')
-        self.y = tf.placeholder(tf.float32, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1], name='input_y')
-        self.frames = tf.placeholder(tf.float32, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1], name='frames')
+        self.seq = tf.placeholder(tf.float32, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1],
+                                  name='seq')
+        self.event_location = tf.placeholder(tf.float32, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1],
+                                             name='event_location')
+        self.training = tf.placeholder(tf.bool, shape=())
 
-        self.predict_output = self.predict(self.x)
+        # MODEL OUTPUTS -------------------------------------------------------------------------------------
+        self.focus_logits = self.model()
+        if self.run_focus:
+            self.focus_output = tf.sigmoid(self.focus_logits)
+        else:
+            self.focus_output = tf.zeros_like(self.seq)
 
-        self.loss_predict = tf.losses.mean_squared_error(labels=self.y, predictions=self.predict_output) * 10
+        # self.focus_output *= self.matrix_contain_events
+        # self.combined_logits = self.focus_logits * self.context_logits
+        # ---------------------------------------------------------------------------------------------------
+
+        # LOSSES --------------------------------------------------------------------------------------------
+        self.focus_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+                labels=self.event_location, logits=self.focus_logits)) * 10
 
         params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-
         self.lossL2 = tf.add_n([tf.nn.l2_loss(v) for v in params if 'bias' not in v.name]) * 1e-5
 
-        # self.loss = self.loss_dropout + self.loss_reconstr  # + self.loss_probs_diversity
-        self.loss = self.loss_predict + self.lossL2
-
+        self.loss = self.focus_loss + self.lossL2  # + self.focus_loss + self.combined_loss
         self.train_op = self.optimizer.minimize(self.loss, var_list=params, global_step=self.global_step)
+        # ---------------------------------------------------------------------------------------------------
 
-        y_mask = tf.where(tf.greater(self.predict_output, 0.5),
-                          tf.constant(1.0, shape=self.predict_output.shape, dtype=tf.float32),
-                          tf.constant(0.0, shape=self.predict_output.shape, dtype=tf.float32))
-        self.predict_output = y_mask
+        # SUMMARY -------------------------------------------------------------------------------------------
+        ones = tf.ones_like(self.seq)
 
-        ones = tf.ones_like(self.x[0, :, :, :, :])
-        predict_images = tf.concat((self.x[0, :, :, :, :],
-                                    ones[:, :, 0:1, :],
-                                    self.predict_output[0, :, :, :, :],
-                                    ones[:, :, 0:1, :],
-                                    self.y[0, :, :, :, :],
-                                    ones[:, :, 0:1, :],
-                                    self.frames[0, :, :, :, :] / tf.reduce_max(self.frames[0, :, :, :, :])), 2)
-        """
-        x_mask = tf.where(tf.greater(self.x, 1),
-                                 tf.constant(1.0, shape=self.x.shape, dtype=tf.float32),
-                                 tf.constant(0.0, shape=self.x.shape, dtype=tf.float32))
-        y_images = tf.concat((self.x[0, :, :, :, :] * x_mask[0, :, :, :, :],
-                                ones[:, :, 0:1, :],
-                              self.y[0, :, :, :, :]), 2)
-        """
-
-        predict_images_sm = tf.summary.image("predict_images", predict_images, self.seq_len)
-        # y_images_sm = tf.summary.image("y_images", y_images, self.seq_len)
+        focus_images = tf.concat([self.seq[0, :, :, :, :],
+                                  ones[0, :, :, 0:2, :], self.focus_output[0, :, :, :, :],
+                                  ones[0, :, :, 0:2, :], self.event_location[0, :, :, :, :] * self.seq[0, :, :, :, :],
+                                  ones[0, :, :, 0:2, :], self.focus_output[0, :, :, :, :] * self.seq[0, :, :, :, :]], axis=-2)
+        focus_sm = tf.summary.image("focus", focus_images, self.seq_len)
 
         cost_sm = tf.summary.scalar("cost", self.loss)
-        cost_predict_sm = tf.summary.scalar("cost_predict", self.loss_predict)
-        cost_l2_sm = tf.summary.scalar("cost_l2", self.lossL2)
-        self.merge_list = [predict_images_sm,
-                           cost_sm, cost_predict_sm,
-                           cost_l2_sm]
+        focus_cost_sm = tf.summary.scalar("focus_cost", self.focus_loss)
+        lossL2_cost_sm = tf.summary.scalar("lossL2_cost", self.lossL2)
+        self.merge_list = [cost_sm, focus_cost_sm, lossL2_cost_sm,
+                           focus_sm]
         self.summarize = tf.summary.merge(self.merge_list)
 
-        self.summarize_2 = tf.summary.merge([predict_images_sm])
-        self.increment_global_step_op = tf.assign(self.global_step, self.global_step + 1)
+        # TP, FP, TN, FN -----------------------------------------------------------------------------------
+        # th=1
+        self.F1_1 = tf.placeholder_with_default(0.0, (), name='F1_1')
+        self.precision_1 = tf.placeholder_with_default(0.0, (), name='precision_1')
+        self.recall_1 = tf.placeholder_with_default(0.0, (), name='recal_1')
 
-    def preprocess(self, input):
-        input = tf.reshape(input, [self.batch_size * self.seq_len, self.size_x, self.size_y, 1])
+        # self.FN_events = tf.placeholder(tf.float32, [self.test_data.shape[0], self.size_x, self.size_y * 3, 1], name='FN_events')
+        # FN_events_sm = tf.summary.image("FN_events", self.FN_events, self.test_data.shape[0])
 
-        kernel_tensor = tf.constant(0.5, shape=[3, 3, 1])
-        input = tf.nn.erosion2d(input, kernel=kernel_tensor, strides=[1, 1, 1, 1],
-                                        rates=[1, 1, 1, 1], padding='SAME')
-        input_mean = tf.reduce_mean(input)
-        input = tf.where(tf.greater(input, input_mean),
-                                 tf.constant(1.0, shape=input.shape, dtype=tf.float32),
-                                 tf.constant(0.0, shape=input.shape, dtype=tf.float32))
-        input = tf.reshape(input, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1])
-        return input
+        F1_sm = tf.summary.scalar("F1_1_cost", self.F1_1)
+        precision_sm = tf.summary.scalar("precision_1_cost", self.precision_1)
+        recall_sm = tf.summary.scalar("recall_1_cost", self.recall_1)
 
-    def predict(self, x, hidden_no=16):
-        x = tf.reshape(x, [self.batch_size * self.seq_len, self.size_x, self.size_y, 1])
-        conv1 = tf.layers.conv2d(x, hidden_no, [5, 5], padding='same')
-        conv2 = tf.layers.conv2d(conv1, hidden_no, [5, 5], padding='same')
-        conv2 = tf.reshape(conv2, [self.batch_size, self.seq_len, self.size_x, self.size_y, hidden_no])
+        self.test_merge_list = [F1_sm, precision_sm, recall_sm]
+        self.test_summarize_1 = tf.summary.merge(self.test_merge_list)
 
-        conv_lstm_fw = tf.contrib.rnn.ConvLSTMCell(conv_ndims=2,
-                                                  input_shape=[self.size_x, self.size_y, hidden_no],
-                                                  output_channels=hidden_no,
-                                                  kernel_shape=[5, 5],
-                                                  use_bias=True)
-        convlstm_output_fw, _ = tf.nn.dynamic_rnn(conv_lstm_fw, inputs=conv2, dtype=tf.float32, scope='convlstm1')
+        # th=3
+        self.F1_3 = tf.placeholder_with_default(0.0, (), name='F1_3')
+        self.precision_3 = tf.placeholder_with_default(0.0, (), name='precision_3')
+        self.recall_3 = tf.placeholder_with_default(0.0, (), name='recall_3')
 
-        """
-        conv_lstm_bw = tf.contrib.rnn.ConvLSTMCell(conv_ndims=2,
-                                                   input_shape=[self.size_x, self.size_y, hidden_no],
-                                                   output_channels=hidden_no,
-                                                   kernel_shape=[5, 5],
-                                                   use_bias=True)
-        convlstm_output_bw, _ = tf.nn.dynamic_rnn(conv_lstm_bw, inputs=conv2[:, ::-1, :, :, :], dtype=tf.float32, scope='convlstm2')
+        # self.FN_events = tf.placeholder(tf.float32, [self.test_data.shape[0], self.size_x, self.size_y * 3, 1], name='FN_events')
+        # FN_events_sm = tf.summary.image("FN_events", self.FN_events, self.test_data.shape[0])
 
-        convlstm_output = tf.concat((convlstm_output_fw, convlstm_output_bw), axis=-1)
-        """
-        convlstm_output = tf.reshape(convlstm_output_fw, [self.batch_size * self.seq_len, self.size_x, self.size_y, hidden_no])
+        F1_sm = tf.summary.scalar("F1_3_cost", self.F1_3)
+        precision_sm = tf.summary.scalar("precision_3_cost", self.precision_3)
+        recall_sm = tf.summary.scalar("recall_3_cost", self.recall_3)
 
-        conv3 = tf.layers.conv2d(convlstm_output, hidden_no, [5, 5], padding='same')
-        conv3 = tf.layers.conv2d(conv3, 1, [1, 1], padding='same')
-        predict = tf.reshape(conv3, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1])
-        return predict
+        self.test_merge_list = [F1_sm, precision_sm, recall_sm]
+        self.test_summarize_3 = tf.summary.merge(self.test_merge_list)
+        # ---------------------------------------------------------------------------------------------------
+
+    def model(self, hidden_no=32):
+        if self.run_focus:
+            with tf.variable_scope('event_focus'):
+                conv_lstm_fw = tf.contrib.rnn.ConvLSTMCell(conv_ndims=2,
+                                                           input_shape=[self.size_x, self.size_y, 1],
+                                                           output_channels=hidden_no,
+                                                           kernel_shape=[5, 5],
+                                                           use_bias=True)
+                conv_lstm_bw = tf.contrib.rnn.ConvLSTMCell(conv_ndims=2,
+                                                           input_shape=[self.size_x, self.size_y, 1],
+                                                           output_channels=hidden_no,
+                                                           kernel_shape=[5, 5],
+                                                           use_bias=True)
+                outputs, states = tf.nn.bidirectional_dynamic_rnn(conv_lstm_fw, conv_lstm_bw,
+                                                                  inputs=self.seq,
+                                                                  dtype=tf.float32)
+
+                # conv_lstm_2 = tf.contrib.rnn.ConvLSTMCell(conv_ndims=2,
+                #                                           input_shape=[self.size_x, self.size_y, 1],
+                #                                           output_channels=hidden_no,
+                #                                           kernel_shape=[5, 5],
+                #                                           use_bias=True)
+                # focus_convlstm_output, _ = tf.nn.dynamic_rnn(conv_lstm_2,
+                #                                              inputs=tf.concat(outputs, -1),
+                #                                              dtype=tf.float32)
+
+                focus_convlstm_output = tf.layers.dropout(outputs, rate=0.3, training=self.training)
+        else:
+            focus_convlstm_output = tf.zeros_like(self.seq)
+
+        with tf.variable_scope('outputs'):
+            if self.run_focus:
+                focus_convlstm_output = tf.squeeze(focus_convlstm_output)
+                focus_convlstm_output = tf.reshape(focus_convlstm_output, [self.batch_size * self.seq_len, self.size_x, self.size_y, hidden_no])
+                conv1 = tf.layers.conv2d(focus_convlstm_output, hidden_no, [5, 5], padding='same')
+                conv2 = tf.layers.conv2d(conv1, 1, [1, 1], padding='same')
+                focus_output = tf.reshape(conv2, [self.batch_size, self.seq_len, self.size_x, self.size_y, 1])
+            else:
+                focus_output = tf.zeros_like(self.seq)
+
+        return focus_output
+
 
     def get_sample(self):
-        n = np.random.randint(0, self.training_data.shape[0] - self.seq_len, size=self.batch_size)
-        segment_seq = np.transpose(np.array([self.training_data[n + i, :, :, :] for i in range(self.seq_len)]),
-                              [1, 0, 2, 3, 4])
-        segment_seq[segment_seq > 0] = 1
-        x = np.zeros_like(segment_seq)
-        y = np.zeros_like(segment_seq)
-
+        """
+        self.training_data: [frame_id, x, y]
+        self.training_labels: {frame_id, x, y} -> [n, 3]
+        :return:
+        """
+        seq = np.zeros([self.batch_size, self.seq_len, self.size_x, self.size_y, 1])
+        event_location = np.zeros([self.batch_size, self.seq_len, self.size_x, self.size_y, 1])
         for i in range(self.batch_size):
-            labels, _ = label(segment_seq[i, :, :, :])
-            x1, y1 = self.remove_cells(labels)
-            x[i, :, :, :] += x1
-            y[i, :, :, :] += y1
-        frames = np.transpose(np.array([self.training_frames[n + i, :, :, :] for i in range(self.seq_len)]),
-                                [1, 0, 2, 3, 4])
-        return x, y, frames
+            z = np.random.randint(0, self.training_data.shape[0] - self.seq_len)
+            seq_i = self.training_data[z:z + self.seq_len, :, :, :]
+            labels_i = self.select_events(z=z)
 
-    def remove_cells(self, segmentation, count=16):
-        segment_ids = np.unique(segmentation)
-        select = np.arange(segment_ids.shape[0])
-        np.random.shuffle(select)
-        segment_ids = [segment_ids[i] for i in select[:count] if segment_ids[i] > 0]
+            # Create matrices
+            matrix_pos_i, matrix_neg_i, event_location_i = self.event_matrix(seq=seq_i, labels=labels_i)
 
-        x = np.zeros_like(segmentation)
-        x[segmentation > 0] = 1
-        y = np.zeros_like(segmentation)
+            # Data augmentation
+            flip_rotate_type = np.random.randint(0, 3)
+            seq_i = self.flip_rotate(seq_i, type=flip_rotate_type)
+            event_location_i = self.flip_rotate(event_location_i, type=flip_rotate_type)
 
-        for id in segment_ids:
-            y_0 = np.zeros_like(segmentation)
-            y_0[segmentation == id] = 1
-            y_sum = np.sum(y_0, axis=(1, 2))
-            inds = np.where(y_sum > 0)[0]
-            if len(inds) >= 2:
-                begin, end = inds[0], inds[-1]
-                y[begin + 1:end + 1, :, :] += y_0[begin + 1:end + 1, :, :]
-                y_0[begin, :, :] = y_0[begin, :, :] * -1
-                # y_0[end, :, :] = y_0[end, :, :] * -2
-                x -= y_0
-        # x = x - y
-        return x, y
+            seq[i, :, :, :, :] = seq_i
+            event_location[i, :, :, :, :] = event_location_i
+        return seq, event_location
 
-    def get_inference_frames(self, x=0):
-        more_frames = True
-        # n = np.random.randint(0, self.training_data.shape[0] - self.seq_len, size=self.batch_size)
-        n = np.arange(x, np.minimum(x + self.batch_size, self.training_data.shape[0] - self.seq_len))
-        segment_seq = np.transpose(np.array([self.training_data[n + i, :, :, :] for i in range(self.seq_len)]),
-                                   [1, 0, 2, 3, 4])
+    def flip_rotate(self, seq, type=0):
+        seq = np.squeeze(seq, -1)
+        seq_2 = np.zeros(seq.shape)
 
-        frames = np.transpose(np.array([self.training_frames[n + i, :, :, :] for i in range(self.seq_len)]),
-                              [1, 0, 2, 3, 4])
+        for i in range(seq.shape[0]):
+            if type == 0:
+                seq_2[i, :, :] = np.fliplr(seq[i, :, :])
+            elif type == 1:
+                seq_2[i, :, :] = np.flipud(seq[i, :, :])
+            elif type == 2:
+                seq_2[i, :, :] = np.rot90(seq[i, :, :], 2)
+        seq_2 = np.expand_dims(seq_2, -1)
+        return seq_2
 
-        shape = segment_seq.shape
-        zeros_size = 0
-        if shape[0] < self.batch_size:
-            segment_seq = np.concatenate((segment_seq, np.zeros([self.batch_size - segment_seq.shape[0]] + list(segment_seq.shape[1:]))), 0)
-            frames = np.concatenate((frames, np.zeros([self.batch_size - frames.shape[0]] + list(frames.shape[1:]))), 0)
-            more_frames = False
-            zeros_size = self.batch_size - shape[0]
-        return segment_seq, frames, x + self.batch_size, more_frames, zeros_size
+    def select_events(self, z=0):
+        z_min = z + 1
+        z_max = z + self.seq_len - 1
+        labels = self.training_labels[(self.training_labels[:, 0] >= z_min) & (self.training_labels[:, 0] <= z_max)]
+        for i in range(labels.shape[0]):
+            labels[i, 0] = labels[i, 0] - z
+            labels[i, 1] = int(np.round(labels[i, 1] / self.res_reduce))
+            labels[i, 2] = int(np.round(labels[i, 2] / self.res_reduce))
+        return labels
+
+    def event_matrix(self, seq=None, labels=None, z_range=8, xy_range=20, variance=8):
+        matrix_pos = np.zeros_like(seq)
+        event_location = np.zeros([seq.shape[0], seq.shape[1] + 50, seq.shape[2] + 50, 1])
+        for i in range(labels.shape[0]):
+            label = labels[i, :]
+
+            z_0 = np.random.randint(label[0] - z_range, label[0] - 3)
+            z_0 = 1 if z_0 < 1 else z_0
+            z_1 = np.random.randint(label[0] + 3, label[0] + z_range)
+            z_1 = self.seq_len - 1 if z_1 > self.seq_len - 1 else z_1
+
+            x_0 = np.random.randint(label[1] - xy_range/2 - variance/2, label[1] - variance)
+            x_0 = 0 if x_0 < 1 else x_0
+            x_1 = x_0 + np.random.randint(xy_range, xy_range + variance)
+            x_1 = seq.shape[1] if x_1 > seq.shape[1] else x_1
+
+            y_0 = np.random.randint(label[2] - xy_range/2 - variance/2, label[2] - variance)
+            y_0 = 0 if y_0 < 1 else y_0
+            y_1 = y_0 + np.random.randint(xy_range, xy_range + variance)
+            y_1 = seq.shape[2] if y_1 > seq.shape[2] else y_1
+
+            matrix_pos[z_0:z_1, x_0:x_1, y_0:y_1, 0] = 1.0
+
+            e_z = int(label[0])
+            e_x = int(label[1]) + 25
+            e_y = int(label[2]) + 25
+            # print e_z, e_x, e_y, 'e_z, e_x, e_y'
+            event_location[e_z - self.z_tolerance_training:e_z + self.z_tolerance_training + 1,
+                            e_x - self.xy_tolerance + 1: e_x + self.xy_tolerance,
+                            e_y - self.xy_tolerance + 1: e_y + self.xy_tolerance, :] = 1.0
+
+        matrix_neg = np.ones_like(seq)
+        matrix_neg[matrix_pos > 0] = 0.0
+
+        event_location = event_location[:, 25:-25, 25:-25]
+        # event_location = event_location * matrix_pos
+        return matrix_pos, matrix_neg, event_location
+
+    def non_event_matrix(self, seq=None, event_matrix_pos=None, z_range=8, xy_range=20, variance=8):
+        non_event_matrix_neg = np.ones_like(seq)
+        count = 0
+        while count < 15:
+            z_0 = np.random.randint(1, self.seq_len - 4)
+            z_1 = z_0 + np.random.randint(6, z_range * 2)
+            z_1 = self.seq_len - 1 if z_1 > self.seq_len - 1 else z_1
+            x_0 = np.random.randint(0, event_matrix_pos.shape[1] - xy_range - variance)
+            x_1 = x_0 + np.random.randint(xy_range, xy_range + variance)
+            y_0 = np.random.randint(0, event_matrix_pos.shape[2] - xy_range - variance)
+            y_1 = y_0 + np.random.randint(xy_range, xy_range + variance)
+
+            if np.sum(event_matrix_pos[z_0:z_1, x_0:x_1, y_0:y_1]) == 0:
+                non_event_matrix_neg[z_0:z_1, x_0:x_1, y_0:y_1, 0] = 0.0
+                count += 1
+
+        return non_event_matrix_neg
+
 
     def run_train(self):
         with self.session.as_default(), self.session.graph.as_default():
-            print 'started ---'
+            print 'started ---', self.epoch_size, 'epoch_size'
             self.gs = self.session.run(self.global_step)
             try:
-                while self.gs <= 5100:
+                while self.gs < 21000:
                     self.train_step()
 
                 tf.logging.info("Reached global step {}. Stopping.".format(self.gs))
@@ -221,76 +308,185 @@ class M3(object):
     def train_step(self):
         start_time = time.time()
         # Get sample
-        x, y, frames = self.get_sample()
-
-        feed_dict = {
-            self.x: x,
-            self.y: y,
-            self.frames: frames
-        }
-
-        loss, summary, _, self.gs = self.session.run([
-            self.loss, self.summarize, self.train_op, self.global_step], feed_dict)
-        duration = time.time() - start_time
+        seq, event_location = self.get_sample()
 
         # emit summaries
-        if self.gs % 10 == 1:
-            print duration, self.gs, 'duration, self.gs'
-            print loss, 'loss'
+        if self.gs % 30 != 1:
+            feed_dict = {
+                self.training: True,
+                self.seq: seq,
+                self.event_location: event_location
+            }
+            _, self.gs = self.session.run([self.train_op, self.global_step],
+                                                         feed_dict)
+            duration = time.time() - start_time
+            if self.gs % 10 == 1:
+                print duration, self.gs, 'duration, gs'
 
-        if self.gs % 10 == 4:
-            print 'summary ---'
+        else:
+            feed_dict = {
+                self.training: True,
+                self.seq: seq,
+                self.event_location: event_location
+            }
+            loss, summary, _, self.gs = self.session.run([self.loss, self.summarize, self.train_op, self.global_step],
+                                                         feed_dict)
+            duration = time.time() - start_time
             self.summary_writer.add_summary(summary, self.gs)
+            print duration, self.gs, 'duration, gs, --- summary'
 
         if self.gs % 2000 == 100:
             print("Saving model checkpoint: {}".format(str(self.gs)))
             self.saver.save(self.session, os.path.join(self.checkpoint_dir, 'my_model'), global_step=self.gs)
 
-    def inference(self, ends_segments):
-        ends_segments[ends_segments >= 3.0] = 1.0
-        self.training_data[self.training_data > 0] = 1
-        self.training_data = self.training_data + ends_segments
+        if self.gs % 100 == 10:
+            print 'testing ---'
+            self.test()
 
-        more_frames = True
-        x = 0
-        big_probs = None
-        zeros_size = 0
-        while more_frames:
-            print x, 'x'
-            segment_seq, frames, x, more_frames, zeros_size = self.get_inference_frames(x)
+    def get_test_sample(self, z=0):
+        z0 = z
+        z1 = z + self.seq_len
+        seq = self.test_data_running[z0:z1, :, :, :]
+        if z1 >= self.test_data.shape[0]:
+            z_next = None
+        else:
+            z_next = z + self.z_jump
+        seq = np.expand_dims(seq, 0)
+        return seq, z_next
 
+    def get_test_labels(self):
+        labels = self.training_labels[self.training_labels[:, 0] >= 110]
+        for i in range(labels.shape[0]):
+            labels[i, 0] = labels[i, 0] - 110
+            labels[i, 1] = int(np.round(labels[i, 1] / self.res_reduce))
+            labels[i, 2] = int(np.round(labels[i, 2] / self.res_reduce))
+        return labels
+
+    def get_center(self, tensor):
+        print np.sum(tensor), 'np.sum(tensor)---'
+        if np.sum(tensor) > 0:
+            # tensor = binary_dilation(tensor, iterations=1)
+
+            labels = label(tensor)
+            no_labels = len(np.unique(labels))
+            print no_labels, 'no_labels'
+            center = center_of_mass(tensor, labels, range(1, no_labels))
+            # print center, 'center ---'
+        else:
+            center = []
+        return center
+
+    def create_gt_matrix(self):
+        gt_matrix = np.zeros([self.test_data.shape[0] + 50, self.test_data.shape[1] + 50, self.test_data.shape[2] + 50])
+        gt_matrix -= 1
+        for i in range(self.test_labels.shape[0]):
+            l = self.test_labels[i, :]
+            l = [int(l[j]) for j in range(len(l))]
+            z = l[0] + 25
+            x = l[1] + 25
+            y = l[2] + 25
+            gt_matrix[z - self.z_tolerance:z + self.z_tolerance + 1, x - self.xy_tolerance: x + self.xy_tolerance + 1, \
+                y - self.xy_tolerance: y + self.xy_tolerance + 1] = float(i)
+        gt_matrix = gt_matrix[25:-25, 25:-25, 25:-25]
+        return gt_matrix
+
+    def create_gt_matrix_2(self):
+        gt_matrix = np.zeros([self.test_data.shape[0] + 50, self.test_data.shape[1] + 50, self.test_data.shape[2] + 50])
+        gt_matrix -= 1
+        for i in range(self.test_labels.shape[0]):
+            l = self.test_labels[i, :]
+            l = [int(l[j]) for j in range(len(l))]
+            z = l[0] + 25
+            x = l[1] + 25
+            y = l[2] + 25
+            gt_matrix[z - 1:z + 2, x - self.xy_tolerance: x + self.xy_tolerance + 1, \
+                y - self.xy_tolerance: y + self.xy_tolerance + 1] = float(i)
+        gt_matrix = gt_matrix[25:-25, 25:-25, 25:-25]
+        return gt_matrix
+
+    def test(self, threshold=0.75, summarize=True):
+        ori_test_data_shape = self.test_data.shape
+        self.test_data_running = np.vstack((self.test_data, np.zeros_like(self.test_data)))
+        self.test_labels = self.get_test_labels()
+
+        z = 0; seq = True
+
+        total_output = np.zeros_like(self.test_data)
+
+        while z is not None:
+            z_old = deepcopy(z)
+            # print z, 'z'
             start_time = time.time()
+            seq, z = self.get_test_sample(z)
             feed_dict = {
-                self.x: segment_seq,
-                self.y: np.zeros_like(segment_seq),
-                self.frames: frames
+                self.training: False,
+                self.seq: seq,
+                self.event_location: np.zeros_like(seq)
             }
-
-            probs, summary, _, self.gs = self.session.run([
-                self.predict_output, self.summarize_2, self.increment_global_step_op, self.global_step], feed_dict)
+            output, _ = self.session.run([self.focus_output, self.global_step], feed_dict)
             duration = time.time() - start_time
-            print duration, 'sec', self.gs
-            self.summary_writer.add_summary(summary, self.gs)
+            # print duration, 'duration'
 
-            probs[probs <= 0.5] = 0
-            probs[probs > 0.5] = 1
-            big_probs = probs if big_probs is None else np.vstack((big_probs, probs))
-        if zeros_size > 0:
-            big_probs = big_probs[:-zeros_size, :, :, :]
+            output[output >= threshold] = 1.0
+            output[output < threshold] = 0.0
+            total_output[z_old:z_old + self.seq_len, :, :, :] += output[0, :, :, :, :]
 
-        predicts = np.zeros_like(self.training_data, dtype=np.float32)
-        for i in range(big_probs.shape[0]):
-            a = big_probs[i, :, :, :, :]
-            b = np.zeros_like(a, dtype=np.float32)
-            b[a > 0.5] = 1.0
-            predicts[i:i+self.seq_len, :, :, :] += b
-        predicts[predicts > 0] = 1
+        total_output[total_output > 0] = 1.0
 
-        frames = np.repeat(self.training_frames, self.segment_groups, -1)
-        segmented_frames = predicts * frames
-        np.savez_compressed('/media/newhd/Ha/my_env/cell_5_segmentation_F0005/events_prediction.npz',
-                            predicts=predicts, predicts_frames=segmented_frames)
+        total_output = total_output[:ori_test_data_shape[0], :, :, 0]
+        center_pred = self.get_center(total_output)
 
+        print center_pred[:5], 'center pred ===='
 
+        for i in [1, 3]:
+            TP, FP, TN, FN = 0.0, 0.0, 0.0, 0.0
+            self.z_tolerance = i
+            self.gt_matrix = self.create_gt_matrix()
+            correct_event_ids = []
+            for i in range(len(center_pred)):
+                c = center_pred[i]
+                # print a[0], a[1], a[2], len(a), 'c---'
+                if np.isnan(c[0]):
+                    continue
+                c = [int(np.round(c[j])) for j in range(len(c))]
+                event_id = self.gt_matrix[c[0], c[1], c[2]]
+                event_id = int(event_id)
+                if event_id < 0:
+                    FP += 1.0
+                else:
+                    xy_dist = np.sqrt((c[1] - self.test_labels[event_id, 1]) ** 2 + (c[2] - self.test_labels[event_id, 2]) ** 2)
+                    if xy_dist <= self.xy_tolerance:
+                        if event_id not in correct_event_ids:
+                            TP += 1.0
+                            correct_event_ids.append(event_id)
+                    else:
+                        FP += 1.0
 
+            FN = self.test_labels.shape[0] - TP
+            print TP, FP, TN, FN, 'TP, FP, TN, FN', len(self.test_labels), 'self.test_labels'
 
+            precision = (TP / (TP + FP)) * 100 if (TP + FP) != 0 else 0
+            recall = (TP / (TP + FN)) * 100 if (TP + FN) != 0 else 0
+            F1_score = 2 * (precision * recall / (precision + recall)) if (precision + recall) != 0 else 0.0
+            print precision, recall, F1_score, 'precision, recall, F1_score'
+            print self.xy_tolerance, 'self.xy_tolerance'
+            print self.z_tolerance, 'self.z_tolerance'
+
+            # SUMMARY
+            if summarize:
+                if self.z_tolerance == 1:
+                    feed_dict = {
+                        self.F1_1: F1_score,
+                        self.precision_1: precision,
+                        self.recall_1: recall,
+                    }
+                    summary, _ = self.session.run([self.test_summarize_1, self.global_step], feed_dict)
+                    self.summary_writer.add_summary(summary, self.gs)
+                else:
+                    feed_dict = {
+                        self.F1_3: F1_score,
+                        self.precision_3: precision,
+                        self.recall_3: recall,
+                    }
+                    summary, _ = self.session.run([self.test_summarize_3, self.global_step], feed_dict)
+                    self.summary_writer.add_summary(summary, self.gs)
